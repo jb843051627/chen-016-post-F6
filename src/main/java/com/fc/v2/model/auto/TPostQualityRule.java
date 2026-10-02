@@ -42,6 +42,11 @@ public class TPostQualityRule implements Serializable {
     @ApiModelProperty(value = "线名")
     private String ruleName;
 
+    /** 所管服务类别 1同城时限 2异地时限 3投递频次 4时限赔偿（各管各的） */
+    @TableField("service_type")
+    @ApiModelProperty(value = "所管服务类别 1同城时限 2异地时限 3投递频次 4时限赔偿")
+    private String serviceType;
+
     /** 低界达标率(百分比) */
     @TableField("th1_max")
     @ApiModelProperty(value = "低界达标率(百分比)")
@@ -133,6 +138,14 @@ public class TPostQualityRule implements Serializable {
 
     public void setRuleName(String ruleName) {
         this.ruleName = ruleName;
+    }
+
+    public String getServiceType() {
+        return serviceType;
+    }
+
+    public void setServiceType(String serviceType) {
+        this.serviceType = serviceType;
     }
 
     public BigDecimal getTh1Max() {
