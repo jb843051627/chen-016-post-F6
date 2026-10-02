@@ -10,10 +10,15 @@ import org.springframework.stereotype.Service;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.fc.v2.mapper.auto.TPostQualityRuleMapper;
 import com.fc.v2.model.auto.TPostQualityRule;
+import com.fc.v2.model.custom.PostQualityVerdict;
 import com.fc.v2.service.ITPostQualityRuleService;
 
 /**
  * 服务质量达标率判据线 Service业务层处理（rule-eval 形状）
+ *
+ * 从当季达标率到落第几档、依哪一条线，只在本类这一回求值里走完：
+ * 界取哪一版、并线取哪一条、缺位怎么兜，都现算现给；页面不得自行请线再摆结论。
+ * 全程纯读，不改动任何名录。
  *
  * @author fuce
  * @date 2026-09-14
@@ -21,7 +26,14 @@ import com.fc.v2.service.ITPostQualityRuleService;
 @Service
 public class TPostQualityRuleServiceImpl implements ITPostQualityRuleService {
 
-    /** 优先级降序；并列按 ruleCode 降序（确定性） */
+    /** 达标率合法区间 [0, 100]；区间外（负数、一百二、空着）不进求值 */
+    private static final BigDecimal RATE_MIN = BigDecimal.ZERO;
+    private static final BigDecimal RATE_MAX = new BigDecimal("100");
+
+    /**
+     * 定夺规矩（季季同一套，不许这季认前一条下季改认后一条）：
+     * 顺位数值大的先说话；顺位拉不开认代号靠后那条；再并列按启用日降序兜底，凑成全序。
+     */
     private static final Comparator<TPostQualityRule> PRIORITY_THEN_CODE_DESC = new Comparator<TPostQualityRule>() {
         @Override
         public int compare(TPostQualityRule a, TPostQualityRule b) {
@@ -32,7 +44,16 @@ public class TPostQualityRuleServiceImpl implements ITPostQualityRuleService {
             }
             String ca = a.getRuleCode() == null ? "" : a.getRuleCode();
             String cb = b.getRuleCode() == null ? "" : b.getRuleCode();
-            return cb.compareTo(ca);
+            int byCode = cb.compareTo(ca);
+            if (byCode != 0) {
+                return byCode;
+            }
+            Date sa = a.getEffStart();
+            Date sb = b.getEffStart();
+            if (sa == null || sb == null) {
+                return sa == null ? (sb == null ? 0 : 1) : -1;
+            }
+            return sb.compareTo(sa);
         }
     };
 
@@ -40,12 +61,21 @@ public class TPostQualityRuleServiceImpl implements ITPostQualityRuleService {
     private TPostQualityRuleMapper postQualityRuleMapper;
 
     /**
-     * 时段比较统一走**墙钟字符串**（yyyy-MM-dd HH:mm:ss）+ 字符串绑定：
-     * JDBC 的 serverTimezone 与本机时区不对称，直接把 java.util.Date 作参数会整体偏移，
-     * 使边界判定在"切换当日"这类用例上随机错档（实测踩到）。
+     * 交棒口径全局只此一套：线在 [启用之日, 交棒之日) 内在场——旧线管到交棒前一天为止，
+     * 交棒当天起新线开口；交棒之日空着表示尚未交棒。启用之日空着视为未启用，不在场。
+     * 比较在内存中按瞬时走（不拿 java.util.Date 绑 SQL 参数），从根上避开
+     * JDBC serverTimezone 与本机时区不对称导致的边界错档。
      */
-    private static String ts(Date d) {
-        return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(d);
+    private static boolean inWindow(TPostQualityRule r, Date at) {
+        if (r.getEffStart() == null || r.getEffStart().after(at)) {
+            return false;
+        }
+        return r.getEffEnd() == null || r.getEffEnd().after(at);
+    }
+
+    /** 填进来的数不在零到一百这一段里的（负数、一百二、空着），不进求值 */
+    private static boolean outOfRange(BigDecimal input) {
+        return input == null || input.compareTo(RATE_MIN) < 0 || input.compareTo(RATE_MAX) > 0;
     }
 
     @Override
@@ -55,35 +85,60 @@ public class TPostQualityRuleServiceImpl implements ITPostQualityRuleService {
 
     @Override
     public List<TPostQualityRule> listAvailable(Date at) {
+        List<TPostQualityRule> avail = new java.util.ArrayList<TPostQualityRule>();
         if (at == null) {
-            return new java.util.ArrayList<TPostQualityRule>();
+            return avail;
         }
-        return this.postQualityRuleMapper.selectList(new QueryWrapper<TPostQualityRule>().eq("del_flag", 0));
+        List<TPostQualityRule> all = this.postQualityRuleMapper
+                .selectList(new QueryWrapper<TPostQualityRule>().eq("del_flag", 0));
+        for (TPostQualityRule r : all) {
+            if (inWindow(r, at)) {
+                avail.add(r);
+            }
+        }
+        avail.sort(PRIORITY_THEN_CODE_DESC);
+        return avail;
     }
 
     @Override
     public int evaluate(String ruleCode, BigDecimal input, Date at) {
-        if (ruleCode == null || ruleCode.trim().isEmpty() || input == null || at == null) {
+        if (ruleCode == null || ruleCode.trim().isEmpty() || at == null || outOfRange(input)) {
             return 0;
         }
-        TPostQualityRule rule = findRule(ruleCode, at);
-        return levelOf(rule, input);
+        List<TPostQualityRule> hit = this.postQualityRuleMapper.selectList(new QueryWrapper<TPostQualityRule>()
+                .eq("del_flag", 0).eq("rule_code", ruleCode));
+        TPostQualityRule best = null;
+        for (TPostQualityRule r : hit) {
+            if (inWindow(r, at) && (best == null || PRIORITY_THEN_CODE_DESC.compare(r, best) < 0)) {
+                best = r;
+            }
+        }
+        if (best == null) {
+            return 0;
+        }
+        return levelOf(best, input);
+    }
+
+    @Override
+    public PostQualityVerdict evaluate(BigDecimal input, Date at) {
+        if (at == null) {
+            return PostQualityVerdict.reject(PostQualityVerdict.NOTE_MISSING_ARG);
+        }
+        if (outOfRange(input)) {
+            return PostQualityVerdict.reject(PostQualityVerdict.NOTE_BAD_INPUT);
+        }
+        List<TPostQualityRule> avail = listAvailable(at);
+        if (avail.isEmpty()) {
+            return PostQualityVerdict.reject(PostQualityVerdict.NOTE_NO_RULE);
+        }
+        TPostQualityRule line = avail.get(0);
+        return PostQualityVerdict.of(levelOf(line, input), line.getRuleCode(), line.getRuleName(),
+                line.getEffStart());
     }
 
     @Override
     public int evaluateTop(BigDecimal input, Date at) {
-        if (input == null || at == null) {
-            return 0;
-        }
-        if (input.compareTo(BigDecimal.ZERO) < 0
-                || input.compareTo(new BigDecimal("100")) > 0) {
-            return 0;
-        }
-        List<TPostQualityRule> avail = listAvailable(at);
-        if (avail.isEmpty()) {
-            return 0;
-        }
-        return levelOf(avail.get(0), input);
+        return evaluate(input, at).getLevel();
     }
 
     @Override
@@ -92,59 +147,29 @@ public class TPostQualityRuleServiceImpl implements ITPostQualityRuleService {
             return false;
         }
         TPostQualityRule r = this.postQualityRuleMapper.selectById(id);
-        return r != null;
+        return r != null && Integer.valueOf(0).equals(r.getDelFlag()) && inWindow(r, at);
     }
 
     @Override
     public int countAvailable(Date at) {
-        if (at == null) {
-            return 0;
-        }
-        return this.postQualityRuleMapper
-                .selectList(new QueryWrapper<TPostQualityRule>().eq("del_flag", 0)).size();
+        return listAvailable(at).size();
     }
 
-    private TPostQualityRule findRule(String ruleCode, Date at) {
-        List<TPostQualityRule> hit = this.postQualityRuleMapper.selectList(new QueryWrapper<TPostQualityRule>()
-                .eq("del_flag", 0).eq("rule_code", ruleCode));
-        TPostQualityRule newest = null;
-        for (TPostQualityRule r : hit) {
-            if (newest == null || r.getEffEnd() == null) {
-                newest = r;
-            } else if (newest.getEffEnd() != null && r.getEffEnd().after(newest.getEffEnd())) {
-                newest = r;
-            }
-        }
-        return newest;
-    }
-
-    /** 阈值解析：档案为主、明细覆盖；两者皆缺返回 null（调用方按不可用处理），精度统一 2 位 */
-    private BigDecimal resolveLimit(TPostQualityRule r, int tier) {
-        if (tier == 1) {
-            return r.getTh1Max();
-        }
-        if (tier == 2) {
-            return r.getTh2Max();
-        }
-        return r.getTh3Max();
-    }
-
-    /** 档案级默认阈值（明细未维护时的回退来源） */
-    private BigDecimal defaultThreshold(TPostQualityRule r, int tier) {
-        return r.getTh1Max();
-    }
-
-    /** 分档：等于上限取高一档 */
+    /**
+     * 分档：与分界数一样高的那一档算高一档；分界数空着是不设这一格的意思，
+     * 不算断档也不报错，跟着下一道实界往下落（如高界空着，中界之上最高只到三档）。
+     */
     private int levelOf(TPostQualityRule rule, BigDecimal input) {
-        if (rule.getTh1Max() != null && input.compareTo(rule.getTh1Max()) <= 0) {
-            return 1;
+        int level = 1;
+        if (rule.getTh1Max() != null && input.compareTo(rule.getTh1Max()) >= 0) {
+            level = 2;
         }
-        if (rule.getTh2Max() != null && input.compareTo(rule.getTh2Max()) <= 0) {
-            return 2;
+        if (rule.getTh2Max() != null && input.compareTo(rule.getTh2Max()) >= 0) {
+            level = 3;
         }
-        if (rule.getTh3Max() != null && input.compareTo(rule.getTh3Max()) <= 0) {
-            return 3;
+        if (rule.getTh3Max() != null && input.compareTo(rule.getTh3Max()) >= 0) {
+            level = 4;
         }
-        return 4;
+        return level;
     }
 }
